@@ -1,0 +1,303 @@
+# Task: Add Amazon Bedrock AI Assistant Integration
+
+Add AI assistant functionality using Amazon Bedrock to answer questions about games in the marketplace.
+
+**Deployment Note**: This project uses `scripts/deploy.sh` for all deployments. See `docs/skills/deployment.md` for best practices.
+
+## Checklist
+
+- [ ] Locate frontend "Ask AI" button
+- [ ] Create CDK stack for Bedrock integration
+- [ ] Create Lambda handler for AI requests
+- [ ] Update frontend to call Lambda
+- [ ] Commit changes
+- [ ] Deploy using scripts/deploy.sh
+
+## 1. Locate Frontend Button
+
+Search for button with text matching `/ask.*ai|ai.*assistant/i` in `src/` directory.
+
+**If found**: Note file path and component name.
+**If not found**: Create button in main game listing component with text "Ask AI About Games".
+
+## 2. Create CDK Stack
+
+Create `infra/lib/stacks/bedrock-stack.ts` following project conventions:
+
+```typescript
+import * as cdk from "aws-cdk-lib";
+import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import * as iam from "aws-cdk-lib/aws-iam";
+import * as apigateway from "aws-cdk-lib/aws-apigateway";
+import { Construct } from "constructs";
+
+export interface BedrockStackProps extends cdk.StackProps {
+  environment: string;
+}
+
+export class BedrockStack extends cdk.Stack {
+  public readonly apiUrl: string;
+
+  constructor(scope: Construct, id: string, props: BedrockStackProps) {
+    super(scope, id, props);
+
+    const { environment } = props;
+
+    const conversationTable = new dynamodb.Table(this, "ConversationHistory", {
+      partitionKey: {
+        name: "conversationId",
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: { name: "timestamp", type: dynamodb.AttributeType.NUMBER },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+    });
+
+    const aiHandler = new lambda.Function(this, "AIHandler", {
+      runtime: lambda.Runtime.NODEJS_18_X,
+      handler: "index.handler",
+      code: lambda.Code.fromAsset("../lambda/ai-handler"), // Path relative to infra directory
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 512,
+      environment: {
+        CONVERSATION_TABLE: conversationTable.tableName,
+      },
+    });
+
+    conversationTable.grantReadWriteData(aiHandler);
+    aiHandler.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["bedrock:InvokeModel"],
+        resources: ["arn:aws:bedrock:*::foundation-model/*"],
+      })
+    );
+
+    const api = new apigateway.RestApi(this, "AIApi", {
+      restApiName: `${id}-API`,
+      description: `AI assistant API - ${environment}`,
+      deployOptions: { stageName: environment },
+    });
+
+    const aiResource = api.root.addResource("ai");
+    aiResource.addMethod("POST", new apigateway.LambdaIntegration(aiHandler));
+
+    this.apiUrl = api.url;
+
+    new cdk.CfnOutput(this, "ApiUrl", {
+      value: api.url,
+      description: "AI API endpoint",
+      exportName: `${id}-ApiUrl`,
+    });
+
+    new cdk.CfnOutput(this, "ConversationTableName", {
+      value: conversationTable.tableName,
+      description: "DynamoDB conversation history table",
+      exportName: `${id}-ConversationTable`,
+    });
+
+    cdk.Tags.of(this).add("Stack", "Bedrock");
+  }
+}
+```
+
+Update `infra/bin/infra.ts`:
+
+```typescript
+import { BedrockStack } from "../lib/stacks/bedrock-stack";
+
+// After FrontendStack instantiation:
+new BedrockStack(app, `GamingMarketBedrock-${environment}`, {
+  env: { account, region },
+  environment,
+  description: `AI assistant backend - ${environment}`,
+});
+```
+
+## 3. Create Lambda Handler
+
+Create `lambda/ai-handler/index.ts`:
+
+```typescript
+import {
+  DynamoDBClient,
+  PutItemCommand,
+  QueryCommand,
+} from "@aws-sdk/client-dynamodb";
+import {
+  BedrockRuntimeClient,
+  InvokeModelCommand,
+} from "@aws-sdk/client-bedrock-runtime";
+
+const dynamodb = new DynamoDBClient({});
+const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
+const TABLE_NAME = process.env.CONVERSATION_TABLE!;
+
+interface Event {
+  body: string;
+}
+
+interface RequestBody {
+  question: string;
+  games: Array<{ title: string; genre: string; price: number }>;
+  conversationId?: string;
+}
+
+export const handler = async (event: Event) => {
+  const { question, games, conversationId } = JSON.parse(
+    event.body
+  ) as RequestBody;
+  const convId = conversationId || `conv-${Date.now()}`;
+
+  const history = await getConversationHistory(convId);
+  const prompt = buildPrompt(question, games, history);
+
+  const response = await bedrock.send(
+    new InvokeModelCommand({
+      modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+      body: JSON.stringify({
+        anthropic_version: "bedrock-2023-05-31",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    })
+  );
+
+  const result = JSON.parse(new TextDecoder().decode(response.body));
+  const answer = result.content[0].text;
+
+  await saveConversation(convId, question, answer);
+
+  return {
+    statusCode: 200,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ answer, conversationId: convId }),
+  };
+};
+
+async function getConversationHistory(conversationId: string) {
+  const result = await dynamodb.send(
+    new QueryCommand({
+      TableName: TABLE_NAME,
+      KeyConditionExpression: "conversationId = :id",
+      ExpressionAttributeValues: { ":id": { S: conversationId } },
+      Limit: 10,
+    })
+  );
+  return result.Items || [];
+}
+
+function buildPrompt(question: string, games: any[], history: any[]) {
+  let prompt =
+    "You are a gaming marketplace assistant. Answer questions about these games:\n\n";
+  prompt += JSON.stringify(games, null, 2) + "\n\n";
+
+  if (history.length > 0) {
+    prompt += "Previous conversation:\n";
+    history.forEach((item) => {
+      prompt += `Q: ${item.question.S}\nA: ${item.answer.S}\n\n`;
+    });
+  }
+
+  prompt += `Question: ${question}`;
+  return prompt;
+}
+
+async function saveConversation(
+  conversationId: string,
+  question: string,
+  answer: string
+) {
+  await dynamodb.send(
+    new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: {
+        conversationId: { S: conversationId },
+        timestamp: { N: Date.now().toString() },
+        question: { S: question },
+        answer: { S: answer },
+      },
+    })
+  );
+}
+```
+
+Create `lambda/ai-handler/package.json`:
+
+```json
+{
+  "name": "ai-handler",
+  "version": "1.0.0",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.0.0"
+  }
+}
+```
+
+## 4. Update Frontend
+
+In the component with "Ask AI" button, add click handler:
+
+```typescript
+const handleAskAI = async () => {
+  const response = await fetch("API_URL_FROM_CDK_OUTPUT/ai", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      question: userQuestion,
+      games: gamesList,
+      conversationId: currentConversationId,
+    }),
+  });
+  const { answer, conversationId } = await response.json();
+  // Display answer to user
+};
+```
+
+Replace `API_URL_FROM_CDK_OUTPUT` with actual API Gateway URL from CDK output.
+
+## 5. Deploy the Stack
+
+**IMPORTANT**: Use the project's deployment script instead of manual CDK commands.
+
+```bash
+# Install Lambda dependencies first
+npm install --prefix lambda/ai-handler
+
+# Deploy all stacks using the project script
+./scripts/deploy.sh
+```
+
+The `deploy.sh` script will:
+
+- Build the frontend
+- Install CDK dependencies
+- Bootstrap CDK if needed
+- Deploy all stacks with hotswap for preview environments
+- Output the API Gateway URL
+
+After deployment, update `src/config/api.ts` with the API URL from the deployment output.
+
+## 6. Commit Strategy
+
+Make 3 commits:
+
+1. "Add Bedrock CDK stack with Lambda and DynamoDB"
+2. "Implement AI handler Lambda function"
+3. "Connect frontend to AI assistant API"
+
+## Critical Requirements
+
+- **NO hardcoded model IDs**: Use environment variable or CDK context for Bedrock model selection
+- **Include conversation history**: Lambda MUST fetch and include previous Q&A in Bedrock prompt
+- **Include games list**: Every Bedrock call MUST receive current games data for context
+
+## Detection Patterns
+
+| Pattern                  | Location       | Action                     |
+| ------------------------ | -------------- | -------------------------- |
+| `/(ask\|question).*ai/i` | Button text    | Use existing button        |
+| `/GameList\|GameGrid/`   | Component name | Add button here            |
+| `/src\/components/`      | Directory      | Search for game components |
